@@ -7,7 +7,7 @@
 
 namespace aero
 {
-#if defined(ROS_MELODIC)
+#if defined(ROS_MELODIC) || defined(ROS_NOETIC)
   typedef Eigen::Isometry3d    Transform;
 #else
   typedef Eigen::Affine3d      Transform;

@@ -73,7 +73,9 @@ include_directories(
 #link_directories(${catkin_LIBRARY_DIRS})
 
 # check ros_distro
-if("$ENV{ROS_DISTRO}" STREQUAL "melodic")
+if("$ENV{ROS_DISTRO}" STREQUAL "noetic")
+  add_definitions(-DROS_NOETIC)
+elseif("$ENV{ROS_DISTRO}" STREQUAL "melodic")
   add_definitions(-DROS_MELODIC)
 elseif("$ENV{ROS_DISTRO}" STREQUAL "kinetic")
   add_definitions(-DROS_KINETIC)
