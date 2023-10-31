@@ -2195,7 +2195,7 @@
   <joint name="l_hand_y_joint" type="revolute">
     <parent link="l_hand_yaw_link"/>
     <child link="l_hand_link"/>
-    <origin rpy="0 1.57079633 3.14159265" xyz="-0.0 -0.02 -0.045"/>
+    <origin rpy="0 1.57079633 1.57079633" xyz="0.0 -0.02 -0.043"/>
     <axis xyz="0 0 1"/>
     <limit effort="500" lower="-0" upper="0.1" velocity="0.6"/>
     <dynamics damping="0.2" friction="0"/>
