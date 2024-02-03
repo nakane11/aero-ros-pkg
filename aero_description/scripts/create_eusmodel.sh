@@ -12,6 +12,6 @@ aero_urdf=${aero_description_path}/robots/aero.urdf
 
 if [ -e ${aero_xacro}  ]
 then
-  rosrun xacro xacro.py ${aero_xacro} > ${aero_urdf}
+  rosrun xacro xacro ${aero_xacro} > ${aero_urdf}
 #  rosrun euscollada collada2eus_urdfmodel -I ${aero_urdf} -O ${aero_l} -C ${aero_yaml}
 fi
