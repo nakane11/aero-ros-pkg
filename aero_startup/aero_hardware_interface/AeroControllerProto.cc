@@ -166,14 +166,38 @@ void SEED485Controller::read(std::vector<uint8_t>& _read_data, const size_t _len
   _read_data.resize(_length);
 
   auto error_code = boost::system::error_code{};
-  int size = 0;
   if (ser_.is_open()) {
     boost::mutex::scoped_lock lock(mtx_);
+
+    // Sync to 0xDF 0xFD header (reply header)
+    uint8_t sync[2] = {0, 0};
+    int retries = 0;
+    while (retries < 200) {
+      std::vector<uint8_t> b(1);
+      int size_read = ser_.read_some(buffer(b, 1), error_code);
+      if (size_read == 1) {
+        sync[0] = sync[1];
+        sync[1] = b[0];
+        if (sync[0] == 0xDF && sync[1] == 0xFD) {
+          break;
+        }
+      }
+      retries++;
+    }
+
+    if (retries >= 200) {
+      std::cerr << "Proto: ERROR: Could not sync to header" << std::endl;
+    }
+
+    _read_data[0] = 0xDF;
+    _read_data[1] = 0xFD;
+
+    int size = 2;
     while(size < _length) {
       usleep(100); // sleep 100 us
       int size_read;
-      std::vector<uint8_t> read_buffer(_length);
-      size_read = ser_.read_some(buffer(read_buffer, _length), error_code);
+      std::vector<uint8_t> read_buffer(_length - size);
+      size_read = ser_.read_some(buffer(read_buffer, _length - size), error_code);
       if ((size + size_read) <= _length) {
         std::copy(read_buffer.begin(), read_buffer.begin()+size_read,
                   _read_data.begin() + size);
