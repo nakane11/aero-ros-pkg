@@ -151,9 +151,13 @@ bool aero::interface::AeroMoveitInterface::setFromIK(const std::string &_move_gr
 
   bool found_ik = false;
   if (_eef_link == "") {
-    found_ik = kinematic_state->setFromIK(jmg_tmp, _pose, _attempts, 0.1);
+    // found_ik = kinematic_state->setFromIK(jmg_tmp, _pose, _attempts, 0.1);
+    found_ik = kinematic_state->setFromIK(jmg_tmp, Eigen::Isometry3d(_pose.matrix()),
+                                          _attempts, 0.1);
   } else {
-    found_ik = kinematic_state->setFromIK(jmg_tmp, _pose, _eef_link, _attempts, 0.1);
+    // found_ik = kinematic_state->setFromIK(jmg_tmp, _pose, _eef_link, _attempts, 0.1);
+    found_ik = kinematic_state->setFromIK(jmg_tmp, Eigen::Isometry3d(_pose.matrix()),
+                                          _eef_link, _attempts, 0.1);
   }
 
 #if 0
@@ -212,7 +216,9 @@ bool aero::interface::AeroMoveitInterface::lifter_ik_(double _x, double _z, std:
   ROS_DEBUG_STREAM("pose: " << _pose);
 
   int _attempts = 3;
-  bool found_ik = kinematic_state->setFromIK(jmg_lifter, _pose, _attempts, 0.1);
+  // bool found_ik = kinematic_state->setFromIK(jmg_lifter, _pose, _attempts, 0.1);
+  bool found_ik = kinematic_state->setFromIK(jmg_lifter, Eigen::Isometry3d(_pose.matrix()),
+                                             _attempts, 0.1);
 
   ROS_DEBUG("lifter: found_ik %d", found_ik);
 
