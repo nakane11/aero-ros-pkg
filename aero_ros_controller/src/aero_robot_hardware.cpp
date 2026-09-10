@@ -42,6 +42,15 @@
 #include "std_msgs/Float32.h"
 
 #include <thread>
+#include <cmath>
+
+namespace {
+  // How long the measured position must stay put before the
+  // controllers are restarted after a communication recovery.
+  const int    SETTLE_CYCLES_     = 8;      // stable control cycles
+  const int    SETTLE_MAX_CYCLES_ = 150;    // give up waiting
+  const double SETTLE_EPS_        = 0.002;  // [rad] / [m]
+}  // namespace
 
 namespace aero_robot_hardware
 {
@@ -114,7 +123,12 @@ bool AeroRobotHW::init(ros::NodeHandle& root_nh, ros::NodeHandle &robot_hw_nh)//
   }
 #endif
   prev_ref_positions_.resize(number_of_angles_);
+  settle_positions_.assign(number_of_angles_, 0.0);
   initialized_flag_ = false;
+  controllers_need_reset_ = false;
+  reset_pending_ = false;
+  settle_count_ = 0;
+  settle_wait_count_ = 0;
 
   std::string model_str;
   if (!root_nh.getParam("robot_description", model_str)) {
@@ -276,6 +290,63 @@ void AeroRobotHW::readPos(const ros::Time& time, const ros::Duration& period, bo
     }
     joint_velocity_[j] = velocity; // read velocity from HW
     joint_effort_[j]   = 0;        // read effort   from HW
+  }
+
+  // A servo power cycle (servo-on button) drops the motor driver
+  // communication. On recovery the command buffers still hold the
+  // pre-outage target, which would snap the arm back to it as soon as
+  // anything is commanded. Restarting the running controllers clears
+  // that: stopping() preempts the active goal and starting() re-inits
+  // their setpoints from the measured position.
+  bool recovered = false;
+  mutex_upper_.lock();
+  recovered |= controller_upper_->check_comm_recovered();
+  mutex_upper_.unlock();
+  mutex_lower_.lock();
+  recovered |= controller_lower_->check_comm_recovered();
+  mutex_lower_.unlock();
+
+  if (recovered) {
+    ROS_WARN("communication recovered: waiting for the robot to settle");
+    reset_pending_ = true;
+    settle_count_ = 0;
+    settle_wait_count_ = 0;
+    settle_positions_ = joint_position_;
+  }
+
+  if (reset_pending_) {
+    // The motor driver calibrates itself when the servo powers on, so
+    // the robot may still be moving right after communication comes
+    // back. Restarting the controllers now would make them hold a
+    // mid-calibration position and pull the robot back to it, so wait
+    // until the measured position stops changing.
+    bool still = true;
+    for (unsigned int j = 0; j < number_of_angles_; j++) {
+      if (std::fabs(joint_position_[j] - settle_positions_[j]) > SETTLE_EPS_) {
+        still = false;
+      }
+    }
+    settle_positions_ = joint_position_;
+    settle_count_ = still ? (settle_count_ + 1) : 0;
+    settle_wait_count_++;
+
+    if (settle_count_ >= SETTLE_CYCLES_ ||
+        settle_wait_count_ >= SETTLE_MAX_CYCLES_) {
+      if (settle_count_ < SETTLE_CYCLES_) {
+        ROS_WARN("still moving after %d cycles, restarting controllers anyway",
+                 settle_wait_count_);
+      } else {
+        ROS_WARN("settled: restarting controllers and resetting command limits");
+      }
+      reset_pending_ = false;
+      controllers_need_reset_ = true;
+      // The saturation interface rate-limits each command against its
+      // own prev_cmd_, which still holds the pre-outage target. Left
+      // alone it would ramp from there, driving the robot back toward
+      // the old position for a moment. Resetting clears prev_cmd_ to
+      // NaN so enforceLimits() re-seeds it from the measured position.
+      pj_sat_interface_.reset();
+    }
   }
 
   if (!initialized_flag_) {

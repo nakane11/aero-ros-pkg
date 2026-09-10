@@ -127,7 +127,9 @@ int main(int argc, char** argv)
     ros::Time now = ros::Time::now();
     ros::Duration period = now - tm;
     hw.read  (now, period);
-    cm.update(now, period);
+    // reset_controllers on the cycle after communication recovered, so
+    // controllers re-init their setpoints from the measured position
+    cm.update(now, period, hw.needControllerReset());
     hw.write (now, period);
     tm = now;
   }

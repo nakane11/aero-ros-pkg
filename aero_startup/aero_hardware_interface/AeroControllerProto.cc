@@ -1,8 +1,82 @@
 #include "AeroControllerProto.hh"
+#include <memory>
+#include <chrono>
+#include <boost/asio/deadline_timer.hpp>
+#include <boost/date_time/posix_time/posix_time.hpp>
 
 using namespace boost::asio;
 using namespace aero;
 using namespace controller;
+
+namespace {
+  // Per-attempt read timeout. If the motor driver board has no power
+  // yet (e.g. before the servo-on button is pressed), no bytes ever
+  // arrive; without a timeout, read_some() blocks forever.
+  const int kReadTimeoutMs = 100;
+  // Bounds on top of the per-call timeout above, so a single
+  // get_command() gives up after roughly (bound * kReadTimeoutMs)
+  // instead of spinning forever. The caller (update_position(), called
+  // every control cycle) will simply try again next cycle, so this
+  // doubles as the retry loop once the hardware starts responding.
+  const int kMaxSyncRetries = 5;
+  const int kMaxBodyReadAttempts = 5;
+
+  struct ReadOpState {
+    bool done = false;
+    bool timed_out = false;
+    size_t bytes = 0;
+  };
+
+  // Prints _msg through std::cerr at most once every kLogThrottleSec,
+  // regardless of how often this is called. Communication-loss errors
+  // (e.g. while the servo-on button is off) repeat every retry cycle,
+  // which would otherwise flood the console.
+  const double kLogThrottleSec = 10.0;
+  void log_throttled(const std::string& _msg,
+                      std::chrono::steady_clock::time_point& _last)
+  {
+    auto now = std::chrono::steady_clock::now();
+    if (_last.time_since_epoch().count() != 0 &&
+        std::chrono::duration<double>(now - _last).count() < kLogThrottleSec) {
+      return;
+    }
+    _last = now;
+    std::cerr << _msg << std::endl;
+  }
+}  // namespace
+
+//////////////////////////////////////////////////
+int SEED485Controller::read_some_timed(
+    std::vector<uint8_t>& _buf, size_t _want, int _timeout_ms)
+{
+  io_.reset();
+
+  auto state = std::make_shared<ReadOpState>();
+  auto timer = std::make_shared<boost::asio::deadline_timer>(io_);
+
+  timer->expires_from_now(boost::posix_time::milliseconds(_timeout_ms));
+  timer->async_wait(
+      [this, state](const boost::system::error_code& ec) {
+        if (!ec && !state->done) {
+          state->timed_out = true;
+          ser_.cancel();
+        }
+      });
+
+  ser_.async_read_some(
+      buffer(_buf, _want),
+      [state, timer](const boost::system::error_code& ec, size_t n) {
+        state->done = true;
+        state->bytes = ec ? 0 : n;
+        timer->cancel();
+      });
+
+  while (!state->done && !state->timed_out) {
+    io_.run_one();
+  }
+
+  return state->timed_out ? 0 : static_cast<int>(state->bytes);
+}
 
 //////////////////////////////////////////////////
 SEED485Controller::SEED485Controller(
@@ -165,16 +239,15 @@ void SEED485Controller::read(std::vector<uint8_t>& _read_data, const size_t _len
 {
   _read_data.resize(_length);
 
-  auto error_code = boost::system::error_code{};
   if (ser_.is_open()) {
     boost::mutex::scoped_lock lock(mtx_);
 
     // Sync to 0xDF 0xFD header (reply header)
     uint8_t sync[2] = {0, 0};
     int retries = 0;
-    while (retries < 200) {
+    while (retries < kMaxSyncRetries) {
       std::vector<uint8_t> b(1);
-      int size_read = ser_.read_some(buffer(b, 1), error_code);
+      int size_read = read_some_timed(b, 1, kReadTimeoutMs);
       if (size_read == 1) {
         sync[0] = sync[1];
         sync[1] = b[0];
@@ -182,22 +255,30 @@ void SEED485Controller::read(std::vector<uint8_t>& _read_data, const size_t _len
           break;
         }
       }
+      // size_read == 0 means the read timed out with no data, most
+      // likely because the motor driver has no power yet.
       retries++;
     }
 
-    if (retries >= 200) {
-      std::cerr << "Proto: ERROR: Could not sync to header" << std::endl;
+    if (retries >= kMaxSyncRetries) {
+      static std::chrono::steady_clock::time_point last_log;
+      log_throttled("Proto: ERROR: Could not sync to header", last_log);
+      return;
     }
 
     _read_data[0] = 0xDF;
     _read_data[1] = 0xFD;
 
     int size = 2;
-    while(size < _length) {
-      usleep(100); // sleep 100 us
+    int attempts = 0;
+    while (size < _length && attempts < kMaxBodyReadAttempts) {
       int size_read;
       std::vector<uint8_t> read_buffer(_length - size);
-      size_read = ser_.read_some(buffer(read_buffer, _length - size), error_code);
+      size_read = read_some_timed(read_buffer, _length - size, kReadTimeoutMs);
+      if (size_read == 0) {
+        attempts++;
+        continue;
+      }
       if ((size + size_read) <= _length) {
         std::copy(read_buffer.begin(), read_buffer.begin()+size_read,
                   _read_data.begin() + size);
@@ -212,6 +293,11 @@ void SEED485Controller::read(std::vector<uint8_t>& _read_data, const size_t _len
         break;
       }
       size += size_read;
+    }
+
+    if (attempts >= kMaxBodyReadAttempts) {
+      static std::chrono::steady_clock::time_point last_log;
+      log_throttled("Proto: ERROR: timed out waiting for response body", last_log);
     }
   }
 
@@ -345,7 +431,8 @@ void SEED485Controller::send_data(std::vector<uint8_t>& _send_data)
 //////////////////////////////////////////////////
 AeroControllerProto::AeroControllerProto(const std::string& _port,
 					 uint8_t _id) :
-  seed_(_port, _id), verbose_(false), bad_status_(false)
+  seed_(_port, _id), verbose_(false), comm_was_lost_(true),
+  comm_recovered_latch_(false), bad_status_(false)
 {
 }
 
@@ -470,10 +557,39 @@ void AeroControllerProto::update_position()
     // just return ref_vector in debug mode
     stroke_cur_vector_.assign(stroke_ref_vector_.begin(),
                               stroke_ref_vector_.end());
-  } else {
-    //seed_.flush();
-    get_command(CMD_GET_POS, stroke_cur_vector_);
+    return;
   }
+
+  //seed_.flush();
+  note_comm_result(get_command(CMD_GET_POS, stroke_cur_vector_));
+}
+
+//////////////////////////////////////////////////
+void AeroControllerProto::note_comm_result(bool _ok)
+{
+  if (!_ok) {
+    comm_was_lost_ = true;
+    return;
+  }
+
+  if (comm_was_lost_) {
+    // Just recovered from a communication loss (e.g. the servo-on
+    // button was cycled while the motor driver had no power). The
+    // stale targets are cleaned up by the caller restarting the
+    // controllers, which re-initializes their setpoints from the
+    // measured position; only report the recovery here.
+    comm_was_lost_ = false;
+    comm_recovered_latch_ = true;
+    std::cerr << "Proto: communication recovered" << std::endl;
+  }
+}
+
+//////////////////////////////////////////////////
+bool AeroControllerProto::check_comm_recovered()
+{
+  bool recovered = comm_recovered_latch_;
+  comm_recovered_latch_ = false;
+  return recovered;
 }
 
 //////////////////////////////////////////////////
@@ -504,7 +620,7 @@ void AeroControllerProto::get_temperature(
 }
 
 //////////////////////////////////////////////////
-void AeroControllerProto::get_data(std::vector<int16_t>& _stroke_vector)
+bool AeroControllerProto::get_data(std::vector<int16_t>& _stroke_vector)
 {
   std::vector<uint8_t> dat;
   dat.resize(RAW_DATA_LENGTH);
@@ -519,10 +635,12 @@ void AeroControllerProto::get_data(std::vector<int16_t>& _stroke_vector)
 
   if (header != 0xdffd) {
     seed_.flush();
-    std::cerr << "Proto: ERROR: invalid header" << std::endl;
-    return;
+    static std::chrono::steady_clock::time_point last_log;
+    log_throttled("Proto: ERROR: invalid header", last_log);
+    return false;
   }
 
+  bool matched = false;
   if (cmd == CMD_MOVE_ABS_POS ||
       cmd == CMD_MOVE_ABS_POS_RET ||
       cmd == CMD_GET_POS ||
@@ -531,6 +649,7 @@ void AeroControllerProto::get_data(std::vector<int16_t>& _stroke_vector)
       cmd == CMD_GET_AD ||
       cmd == CMD_GET_DIO ||
       cmd == CMD_WATCH_MISSTEP) {
+    matched = true;
     _stroke_vector.resize(stroke_joint_indices_.size());
     // raw to stroke
     for (size_t i = 0; i < stroke_joint_indices_.size(); ++i) {
@@ -559,17 +678,18 @@ void AeroControllerProto::get_data(std::vector<int16_t>& _stroke_vector)
     }
   }
 
+  return matched;
 }
 
 //////////////////////////////////////////////////
-void AeroControllerProto::get_command(uint8_t _cmd,
+bool AeroControllerProto::get_command(uint8_t _cmd,
                                       std::vector<int16_t>& _stroke_vector)
 {
-  get_command(_cmd, 0x00, _stroke_vector);
+  return get_command(_cmd, 0x00, _stroke_vector);
 }
 
 //////////////////////////////////////////////////
-void AeroControllerProto::get_command(uint8_t _cmd, uint8_t _sub,
+bool AeroControllerProto::get_command(uint8_t _cmd, uint8_t _sub,
                                       std::vector<int16_t>& _stroke_vector)
 {
   boost::mutex::scoped_lock lock(ctrl_mtx_);
@@ -577,7 +697,7 @@ void AeroControllerProto::get_command(uint8_t _cmd, uint8_t _sub,
   std::vector<uint8_t> dat(RAW_DATA_LENGTH);
   seed_.send_command(_cmd, _sub, 0, dat);
   //usleep(1000 * 20);  // wait
-  get_data(_stroke_vector);
+  return get_data(_stroke_vector);
 }
 
 //////////////////////////////////////////////////
@@ -607,7 +727,9 @@ void AeroControllerProto::set_position(
     stroke_cur_vector_.assign(stroke_ref_vector_.begin(),
                               stroke_ref_vector_.end());
   } else {
-    get_data(stroke_cur_vector_);
+    // this, not update_position(), is the read-back that runs every
+    // control cycle, so communication loss/recovery is tracked here
+    note_comm_result(get_data(stroke_cur_vector_));
   }
 }
 

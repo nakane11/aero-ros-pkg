@@ -175,6 +175,16 @@ public:
   double getPeriod() { return ((double)CONTROL_PERIOD_US_) / (1000 * 1000); }
   double getOverLapScale() { return OVERLAP_SCALE_; }
 
+  /// @brief true once after the motor driver communication recovered.
+  ///   Pass it to ControllerManager::update() as reset_controllers so
+  ///   running controllers re-initialize their setpoints from the
+  ///   measured position instead of the stale pre-outage target.
+  bool needControllerReset() {
+    bool reset = controllers_need_reset_;
+    controllers_need_reset_ = false;
+    return reset;
+  }
+
 protected:
   // Methods used to control a joint.
   enum ControlMethod {EFFORT, POSITION, POSITION_PID, VELOCITY, VELOCITY_PID};
@@ -215,6 +225,15 @@ protected:
   boost::shared_ptr<AeroLowerController > controller_lower_;
 
   bool initialized_flag_;
+  bool controllers_need_reset_;
+
+  // Waiting for the robot to stop moving after communication came
+  // back: the motor driver calibrates itself on servo power-on, and
+  // controllers must only be restarted once that motion has finished.
+  bool reset_pending_;
+  int  settle_count_;
+  int  settle_wait_count_;
+  std::vector<double> settle_positions_;
   bool upper_send_enable_;
 
   int   CONTROL_PERIOD_US_;

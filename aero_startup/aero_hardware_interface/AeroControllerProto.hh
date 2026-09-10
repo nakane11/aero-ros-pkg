@@ -45,6 +45,16 @@ namespace aero
       /// @brief read from SEED controller
      public: void read(std::vector<uint8_t>& _read_data, const size_t _length=RAW_DATA_LENGTH);
 
+      /// @brief read_some bounded by a timeout.
+      ///   boost::asio::serial_port keeps its fd in non-blocking mode
+      ///   internally, so termios VMIN/VTIME has no effect on
+      ///   read_some() -- a synchronous call can still block forever
+      ///   via asio's own reactor wait. This uses async_read_some with
+      ///   a deadline_timer to actually bound the wait.
+      /// @return number of bytes read, 0 on timeout
+     private: int read_some_timed(std::vector<uint8_t>& _buf, size_t _want,
+                                  int _timeout_ms);
+
       /// @brief send command to SEED controller
       /// @param _cmd Command ID
       /// @param _time Destination time
@@ -145,6 +155,15 @@ namespace aero
       ///   to access position externally, use get_actual_stroke_vector
      public: void update_position();
 
+      /// @brief true once after communication recovered from a loss
+      ///   (e.g. the servo-on button was cycled). Reading it clears
+      ///   the flag, so the caller can restart its controllers exactly
+      ///   once per recovery.
+     public: bool check_comm_recovered();
+
+      /// @brief track communication loss/recovery of a read-back
+     protected: void note_comm_result(bool _ok);
+
       /// @brief updates robot status (checks step out joints)
      public: void update_status();
 
@@ -161,15 +180,17 @@ namespace aero
       /// @brief get data from buffer,
       ///   this does not call command, but only read from buffer
       /// @param _stroke_vector stroke vector
-     protected: void get_data(std::vector<int16_t>& _stroke_vector);
+      /// @return true if a valid response was parsed
+     protected: bool get_data(std::vector<int16_t>& _stroke_vector);
 
       /// @brief abstract of get commands
       /// @param _cmd command id
       /// @param _stroke_vector stroke vector
-     protected: void get_command(uint8_t _cmd,
+      /// @return true if a valid response was parsed
+     protected: bool get_command(uint8_t _cmd,
                                  std::vector<int16_t>& _stroke_vector);
 
-     protected: void get_command(uint8_t _cmd, uint8_t _sub,
+     protected: bool get_command(uint8_t _cmd, uint8_t _sub,
                                  std::vector<int16_t>& _stroke_vector);
 
       /// @brief set position command (waiting return of current position)
@@ -228,6 +249,15 @@ namespace aero
      protected: std::vector<int16_t> stroke_ref_vector_;
 
      protected: std::vector<int16_t> stroke_cur_vector_;
+
+      /// @brief true whenever the last read-back got no response
+      ///   (e.g. motor driver unpowered). Used to detect the moment
+      ///   communication recovers.
+     protected: bool comm_was_lost_;
+
+      /// @brief set when a recovery is detected, cleared by
+      ///   check_comm_recovered()
+     protected: bool comm_recovered_latch_;
 
      protected: std::vector<AJointIndex> stroke_joint_indices_;
 
