@@ -1,36 +1,55 @@
 #include "AeroControllerProto.hh"
-#include <memory>
 #include <chrono>
-#include <boost/asio/deadline_timer.hpp>
-#include <boost/date_time/posix_time/posix_time.hpp>
+#include <poll.h>
 
 using namespace boost::asio;
 using namespace aero;
 using namespace controller;
 
 namespace {
-  // Per-attempt read timeout. If the motor driver board has no power
-  // yet (e.g. before the servo-on button is pressed), no bytes ever
-  // arrive; without a timeout, read_some() blocks forever.
-  const int kReadTimeoutMs = 100;
-  // Bounds on top of the per-call timeout above, so a single
-  // get_command() gives up after roughly (bound * kReadTimeoutMs)
-  // instead of spinning forever. The caller (update_position(), called
-  // every control cycle) will simply try again next cycle, so this
-  // doubles as the retry loop once the hardware starts responding.
+  // Per-attempt read timeout for a single poll()+read_some(). The
+  // control loop runs at 15 Hz (aero_bringup.launch controller_rate),
+  // i.e. a ~67 ms period, so this must stay well under that -- a real
+  // response, once the driver is listening, arrives within a handful
+  // of milliseconds. This only bounds how long we wait for bytes that
+  // may never come; it previously sat at 100 ms, already longer than
+  // one whole control period by itself.
+  const int kReadTimeoutMs = 15;
+  // Total per-phase budget (sync-to-header / read-body), in units of
+  // kReadTimeoutMs. Kept short too -- long-run retrying is handled one
+  // level up, by get_command() resending the whole command.
   const int kMaxSyncRetries = 5;
   const int kMaxBodyReadAttempts = 5;
 
-  struct ReadOpState {
-    bool done = false;
-    bool timed_out = false;
-    size_t bytes = 0;
-  };
+  // How many times get_command() resends the command before giving
+  // up. This is the actual fix for the original bug: a command sent
+  // while the motor driver is mid-calibration (servo-on button just
+  // pressed) and not yet listening is silently lost on the wire, and
+  // nothing was ever resending it -- the code would just wait forever
+  // for a reply to a request the hardware never received. Kept small:
+  // at kReadTimeoutMs * (kMaxSyncRetries + kMaxBodyReadAttempts) per
+  // attempt, this is already several control periods worst-case, and
+  // it used to be more than an order of magnitude higher (8 attempts
+  // at 100 ms/try).
+  const int kMaxCommandRetries = 3;
+
+  // How many consecutive failed / good read-backs are required before
+  // comm_was_lost_ / comm_recovered_latch_ actually flip. A single
+  // failed or single lucky read is a routine, self-recovering glitch
+  // (e.g. one misaligned byte from USB-serial jitter) and must not be
+  // confused with the motor driver truly losing/regaining power --
+  // that confusion previously made a single stray read failure look
+  // exactly like a RUNSTOP power cycle, triggering a full controller
+  // restart (stop/start + settle wait) during otherwise normal
+  // operation. 10 consecutive cycles is ~0.7 s at the 15 Hz control
+  // rate, comfortably longer than a one-off glitch but far shorter
+  // than an actual servo power cycle.
+  const int kLossStreakThreshold = 10;
+  const int kRecoveryStreakThreshold = 10;
 
   // Prints _msg through std::cerr at most once every kLogThrottleSec,
   // regardless of how often this is called. Communication-loss errors
-  // (e.g. while the servo-on button is off) repeat every retry cycle,
-  // which would otherwise flood the console.
+  // repeat every retry, which would otherwise flood the console.
   const double kLogThrottleSec = 10.0;
   void log_throttled(const std::string& _msg,
                       std::chrono::steady_clock::time_point& _last)
@@ -49,33 +68,55 @@ namespace {
 int SEED485Controller::read_some_timed(
     std::vector<uint8_t>& _buf, size_t _want, int _timeout_ms)
 {
-  io_.reset();
+  // boost::asio::serial_port keeps its fd non-blocking internally, so
+  // a synchronous read_some() with no data available never blocks. A
+  // plain retries<N loop around it (as this file used to have) is
+  // therefore effectively unbounded in wall-clock time when nothing is
+  // arriving. poll() on the raw fd gives a real, wall-clock timeout
+  // without touching asio's own async machinery.
+  int fd =
+#if ((BOOST_VERSION / 100 % 1000) > 50)
+    ser_.lowest_layer().native_handle();
+#else
+    ser_.lowest_layer().native();
+#endif
 
-  auto state = std::make_shared<ReadOpState>();
-  auto timer = std::make_shared<boost::asio::deadline_timer>(io_);
+  auto deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(_timeout_ms);
 
-  timer->expires_from_now(boost::posix_time::milliseconds(_timeout_ms));
-  timer->async_wait(
-      [this, state](const boost::system::error_code& ec) {
-        if (!ec && !state->done) {
-          state->timed_out = true;
-          ser_.cancel();
-        }
-      });
+  while (true) {
+    auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return 0;
+    }
+    int remaining_ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now).count());
 
-  ser_.async_read_some(
-      buffer(_buf, _want),
-      [state, timer](const boost::system::error_code& ec, size_t n) {
-        state->done = true;
-        state->bytes = ec ? 0 : n;
-        timer->cancel();
-      });
+    pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
 
-  while (!state->done && !state->timed_out) {
-    io_.run_one();
+    int rc = ::poll(&pfd, 1, remaining_ms);
+    if (rc <= 0 || !(pfd.revents & POLLIN)) {
+      return 0;  // timed out, or nothing readable yet
+    }
+
+    boost::system::error_code ec;
+    size_t n = ser_.read_some(buffer(_buf, _want), ec);
+    if (!ec) {
+      return static_cast<int>(n);
+    }
+    if (ec == boost::asio::error::would_block ||
+        ec == boost::asio::error::try_again) {
+      // poll() said readable, but the non-blocking read raced and
+      // found nothing yet -- not a real timeout, retry within the
+      // same deadline instead of burning one of the caller's attempts.
+      continue;
+    }
+    return 0;  // genuine read error
   }
-
-  return state->timed_out ? 0 : static_cast<int>(state->bytes);
 }
 
 //////////////////////////////////////////////////
@@ -255,14 +296,22 @@ void SEED485Controller::read(std::vector<uint8_t>& _read_data, const size_t _len
           break;
         }
       }
-      // size_read == 0 means the read timed out with no data, most
-      // likely because the motor driver has no power yet.
+      // size_read == 0 means the read timed out with no data.
       retries++;
     }
 
     if (retries >= kMaxSyncRetries) {
       static std::chrono::steady_clock::time_point last_log;
       log_throttled("Proto: ERROR: Could not sync to header", last_log);
+      // mtx_ is already held here; flush() would deadlock on it, so
+      // flush the port directly instead. Anything still arriving from
+      // an abandoned exchange must not be left to corrupt the sync
+      // search on the next attempt.
+#if ((BOOST_VERSION / 100 % 1000) > 50)
+      ::tcflush(ser_.lowest_layer().native_handle(), TCIOFLUSH);
+#else  // 12.04
+      ::tcflush(ser_.lowest_layer().native(), TCIOFLUSH);
+#endif
       return;
     }
 
@@ -298,6 +347,13 @@ void SEED485Controller::read(std::vector<uint8_t>& _read_data, const size_t _len
     if (attempts >= kMaxBodyReadAttempts) {
       static std::chrono::steady_clock::time_point last_log;
       log_throttled("Proto: ERROR: timed out waiting for response body", last_log);
+      // Ditto: discard whatever's left of this response so it can't
+      // bleed into the next command's header sync.
+#if ((BOOST_VERSION / 100 % 1000) > 50)
+      ::tcflush(ser_.lowest_layer().native_handle(), TCIOFLUSH);
+#else  // 12.04
+      ::tcflush(ser_.lowest_layer().native(), TCIOFLUSH);
+#endif
     }
   }
 
@@ -432,7 +488,8 @@ void SEED485Controller::send_data(std::vector<uint8_t>& _send_data)
 AeroControllerProto::AeroControllerProto(const std::string& _port,
 					 uint8_t _id) :
   seed_(_port, _id), verbose_(false), comm_was_lost_(true),
-  comm_recovered_latch_(false), bad_status_(false)
+  comm_recovered_latch_(false), comm_fail_streak_(0), comm_ok_streak_(0),
+  bad_status_(false)
 {
 }
 
@@ -557,30 +614,51 @@ void AeroControllerProto::update_position()
     // just return ref_vector in debug mode
     stroke_cur_vector_.assign(stroke_ref_vector_.begin(),
                               stroke_ref_vector_.end());
-    return;
+  } else {
+    //seed_.flush();
+    note_comm_result(get_command(CMD_GET_POS, stroke_cur_vector_));
   }
-
-  //seed_.flush();
-  note_comm_result(get_command(CMD_GET_POS, stroke_cur_vector_));
 }
 
 //////////////////////////////////////////////////
 void AeroControllerProto::note_comm_result(bool _ok)
 {
   if (!_ok) {
-    comm_was_lost_ = true;
+    comm_ok_streak_ = 0;
+    // Debounced: only a run of kLossStreakThreshold consecutive
+    // failures counts as a real loss. A single failed read-back is a
+    // routine, self-recovering glitch (e.g. one misaligned byte from
+    // USB-serial jitter) that resolves on its own within a cycle or
+    // two, and must not be treated as the motor driver losing power.
+    if (comm_fail_streak_ < kLossStreakThreshold) {
+      comm_fail_streak_++;
+    }
+    if (comm_fail_streak_ >= kLossStreakThreshold) {
+      comm_was_lost_ = true;
+    }
     return;
   }
 
+  comm_fail_streak_ = 0;
   if (comm_was_lost_) {
-    // Just recovered from a communication loss (e.g. the servo-on
-    // button was cycled while the motor driver had no power). The
-    // stale targets are cleaned up by the caller restarting the
-    // controllers, which re-initializes their setpoints from the
-    // measured position; only report the recovery here.
-    comm_was_lost_ = false;
-    comm_recovered_latch_ = true;
-    std::cerr << "Proto: communication recovered" << std::endl;
+    // Debounced the same way: only report recovery after
+    // kRecoveryStreakThreshold consecutive good read-backs, not on the
+    // first lucky one, so a full controller restart (stop/start +
+    // settle wait) is triggered only for an actual communication
+    // recovery (e.g. the servo-on button was cycled while the motor
+    // driver had no power), not for a single stray success in the
+    // middle of noisy comms.
+    comm_ok_streak_++;
+    if (comm_ok_streak_ >= kRecoveryStreakThreshold) {
+      comm_was_lost_ = false;
+      comm_ok_streak_ = 0;
+      // The caller (AeroRobotHW) restarts its controllers on this
+      // signal so they re-init their setpoints from the measured
+      // position instead of snapping back to whatever stale target
+      // was set before the loss.
+      comm_recovered_latch_ = true;
+      std::cerr << "Proto: communication recovered" << std::endl;
+    }
   }
 }
 
@@ -694,10 +772,21 @@ bool AeroControllerProto::get_command(uint8_t _cmd, uint8_t _sub,
 {
   boost::mutex::scoped_lock lock(ctrl_mtx_);
 
-  std::vector<uint8_t> dat(RAW_DATA_LENGTH);
-  seed_.send_command(_cmd, _sub, 0, dat);
-  //usleep(1000 * 20);  // wait
-  return get_data(_stroke_vector);
+  // The original code sent the command exactly once and then waited
+  // (unboundedly) for a reply. If the motor driver wasn't listening
+  // at that exact moment -- e.g. mid power-on calibration, right after
+  // the servo-on button is pressed -- the command is simply lost on
+  // the wire, and there was nothing to ever resend it: the code just
+  // waited forever for a reply to a request the hardware never got.
+  // Resending here a few times closes that gap.
+  for (int attempt = 0; attempt < kMaxCommandRetries; ++attempt) {
+    std::vector<uint8_t> dat(RAW_DATA_LENGTH);
+    seed_.send_command(_cmd, _sub, 0, dat);
+    if (get_data(_stroke_vector)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 //////////////////////////////////////////////////

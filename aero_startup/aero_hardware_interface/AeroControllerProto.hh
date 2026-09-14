@@ -46,11 +46,11 @@ namespace aero
      public: void read(std::vector<uint8_t>& _read_data, const size_t _length=RAW_DATA_LENGTH);
 
       /// @brief read_some bounded by a timeout.
-      ///   boost::asio::serial_port keeps its fd in non-blocking mode
-      ///   internally, so termios VMIN/VTIME has no effect on
-      ///   read_some() -- a synchronous call can still block forever
-      ///   via asio's own reactor wait. This uses async_read_some with
-      ///   a deadline_timer to actually bound the wait.
+      ///   boost::asio::serial_port keeps its fd non-blocking
+      ///   internally, so a synchronous read_some() with no data
+      ///   available never blocks; without an explicit deadline this
+      ///   loops effectively forever when nothing is arriving. Uses
+      ///   poll() on the raw fd for a real wall-clock timeout.
       /// @return number of bytes read, 0 on timeout
      private: int read_some_timed(std::vector<uint8_t>& _buf, size_t _want,
                                   int _timeout_ms);
@@ -180,13 +180,17 @@ namespace aero
       /// @brief get data from buffer,
       ///   this does not call command, but only read from buffer
       /// @param _stroke_vector stroke vector
-      /// @return true if a valid response was parsed
+      /// @return true if a valid, recognized response was parsed
      protected: bool get_data(std::vector<int16_t>& _stroke_vector);
 
-      /// @brief abstract of get commands
+      /// @brief abstract of get commands. Resends the command a few
+      ///   times if no valid response comes back -- a command sent
+      ///   while the motor driver isn't listening yet (e.g. mid
+      ///   power-on calibration) is otherwise lost for good, since
+      ///   nothing else would ever resend it.
       /// @param _cmd command id
       /// @param _stroke_vector stroke vector
-      /// @return true if a valid response was parsed
+      /// @return true if a valid response was eventually received
      protected: bool get_command(uint8_t _cmd,
                                  std::vector<int16_t>& _stroke_vector);
 
@@ -250,14 +254,26 @@ namespace aero
 
      protected: std::vector<int16_t> stroke_cur_vector_;
 
-      /// @brief true whenever the last read-back got no response
-      ///   (e.g. motor driver unpowered). Used to detect the moment
-      ///   communication recovers.
+      /// @brief true once a real communication loss is confirmed
+      ///   (kLossStreakThreshold_ consecutive failed read-backs), not
+      ///   on a single failure -- a lone dropped/misaligned byte is a
+      ///   routine, self-recovering glitch and must not be treated the
+      ///   same as the motor driver actually losing power.
      protected: bool comm_was_lost_;
 
-      /// @brief set when a recovery is detected, cleared by
-      ///   check_comm_recovered()
+      /// @brief set when a real recovery is confirmed
+      ///   (kRecoveryStreakThreshold_ consecutive good read-backs
+      ///   after a loss), cleared by check_comm_recovered(). Debounced
+      ///   the same way as comm_was_lost_: a single lucky read in the
+      ///   middle of noisy comms must not trigger a full controller
+      ///   restart.
      protected: bool comm_recovered_latch_;
+
+      /// @brief consecutive failed / good read-backs since the last
+      ///   state change, used to debounce comm_was_lost_ /
+      ///   comm_recovered_latch_.
+     protected: int comm_fail_streak_;
+     protected: int comm_ok_streak_;
 
      protected: std::vector<AJointIndex> stroke_joint_indices_;
 
