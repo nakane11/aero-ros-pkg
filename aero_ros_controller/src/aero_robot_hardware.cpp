@@ -43,13 +43,21 @@
 
 #include <thread>
 #include <cmath>
+#include <limits>
 
 namespace {
-  // How long the measured position must stay put before the
-  // controllers are restarted after a communication recovery.
-  const int    SETTLE_CYCLES_     = 8;      // stable control cycles
-  const int    SETTLE_MAX_CYCLES_ = 150;    // give up waiting
-  const double SETTLE_EPS_        = 0.002;  // [rad] / [m]
+  // Calibration wait (AeroRobotHW::waitForCalibration(), called from
+  // init() before the ControllerManager is constructed, so no
+  // position command can reach a motor driver that is still doing its
+  // origin-return). Poll rate is deliberately low -- STGET is only
+  // used to detect that the driver is answering at all, not for any
+  // control-loop timing.
+  const double CALIBRATION_POLL_RATE_HZ_        = 2.0;
+  // If neither driver has ever replied to STGET after this long,
+  // something is wrong with the STGET-based check itself (not
+  // necessarily the robot), so fall back to a different read-only
+  // command (GET_POS) and require it to succeed reliably instead.
+  const double CALIBRATION_FALLBACK_TIMEOUT_SEC_ = 60.0;
 }  // namespace
 
 namespace aero_robot_hardware
@@ -90,6 +98,17 @@ bool AeroRobotHW::init(ros::NodeHandle& root_nh, ros::NodeHandle &robot_hw_nh)//
   controller_upper_.reset(new AeroUpperController(port_upper));
   controller_lower_.reset(new AeroLowerController(port_lower));
 
+  // Block here, before the ControllerManager (and therefore
+  // follow_joint_trajectory etc.) exists, until origin-return
+  // (calibration) of both motor drivers is confirmed complete. This
+  // used to race: the controller manager could spawn and start
+  // sending position commands (MOVE, 0x14) before calibration
+  // finished, which fights the origin-return motion and makes the arm
+  // vibrate.
+  if (!waitForCalibration()) {
+    return false;
+  }
+
   // joint list
   number_of_angles_ =
     controller_upper_->get_number_of_angle_joints() +
@@ -123,12 +142,9 @@ bool AeroRobotHW::init(ros::NodeHandle& root_nh, ros::NodeHandle &robot_hw_nh)//
   }
 #endif
   prev_ref_positions_.resize(number_of_angles_);
-  settle_positions_.assign(number_of_angles_, 0.0);
   initialized_flag_ = false;
   controllers_need_reset_ = false;
   reset_pending_ = false;
-  settle_count_ = 0;
-  settle_wait_count_ = 0;
 
   std::string model_str;
   if (!root_nh.getParam("robot_description", model_str)) {
@@ -213,6 +229,163 @@ bool AeroRobotHW::init(ros::NodeHandle& root_nh, ros::NodeHandle &robot_hw_nh)//
   return true;
 }
 
+bool AeroRobotHW::waitForCalibration()
+{
+  ROS_INFO("waiting for motor driver origin-return (calibration) to "
+           "complete (polling STGET on upper/lower)...");
+
+  ros::Rate rate(CALIBRATION_POLL_RATE_HZ_);
+  ros::Time start = ros::Time::now();
+
+  bool fallback_active = false;
+  // Sticky: set once GET_POS read-back debounces to "recovered" (see
+  // check_comm_recovered()) for each side, and never cleared, so a
+  // side that recovers first is not lost while waiting for the other.
+  bool fallback_upper_ok = false;
+  bool fallback_lower_ok = false;
+
+  while (ros::ok()) {
+    bool upper_ready = false;
+    bool lower_ready = false;
+    {
+      std::thread t1([&](){
+          mutex_upper_.lock();
+          upper_ready = controller_upper_->poll_calibration_status();
+          mutex_upper_.unlock();
+        });
+      std::thread t2([&](){
+          mutex_lower_.lock();
+          lower_ready = controller_lower_->poll_calibration_status();
+          mutex_lower_.unlock();
+        });
+      t1.join();
+      t2.join();
+    }
+
+    if (upper_ready && lower_ready) {
+      ROS_INFO("=========================================================");
+      ROS_INFO(" Calibration complete: origin-return finished on both");
+      ROS_INFO(" upper and lower motor drivers (STGET responding).");
+      ROS_INFO("=========================================================");
+      return true;
+    }
+
+    double elapsed = (ros::Time::now() - start).toSec();
+
+    // Safety net: if STGET itself never gets a reply (e.g. an issue
+    // with the STGET check itself rather than with calibration), fall
+    // back to a different read-only command (GET_POS, used every
+    // control cycle once running) and require its own debounced
+    // communication-recovery signal instead -- the same one used to
+    // detect recovery from a mid-operation communication loss.
+    if (!fallback_active && elapsed >= CALIBRATION_FALLBACK_TIMEOUT_SEC_) {
+      ROS_WARN("no STGET reply after %.0f s, falling back to GET_POS "
+               "read-back reliability", elapsed);
+      fallback_active = true;
+    }
+
+    if (fallback_active) {
+      std::thread t1([&](){
+          mutex_upper_.lock();
+          controller_upper_->update_position();
+          if (controller_upper_->check_comm_recovered()) {
+            fallback_upper_ok = true;
+          }
+          mutex_upper_.unlock();
+        });
+      std::thread t2([&](){
+          mutex_lower_.lock();
+          controller_lower_->update_position();
+          if (controller_lower_->check_comm_recovered()) {
+            fallback_lower_ok = true;
+          }
+          mutex_lower_.unlock();
+        });
+      t1.join();
+      t2.join();
+
+      if (fallback_upper_ok && fallback_lower_ok) {
+        ROS_WARN("=========================================================");
+        ROS_WARN(" Calibration assumed complete: GET_POS read-back is now");
+        ROS_WARN(" reliable (fallback, no STGET reply was ever received).");
+        ROS_WARN("=========================================================");
+        return true;
+      }
+    }
+
+    ROS_INFO_THROTTLE(5.0,
+        "still waiting for calibration... upper: %s, lower: %s "
+        "(%.0f s elapsed%s)",
+        upper_ready ? "ready" : "waiting",
+        lower_ready ? "ready" : "waiting",
+        elapsed, fallback_active ? ", fallback active" : "");
+
+    rate.sleep();
+  }
+
+  ROS_WARN("aborted waiting for calibration: ros::ok() returned false");
+  return false;
+}
+
+void AeroRobotHW::pollCalibrationCompletion()
+{
+  // STGET only -- deliberately does not also poll GET_POS (e.g. via
+  // readPos()/update_position()) in the same cycle. waitForCalibration()
+  // above polls STGET exclusively and is known to detect completion
+  // reliably; interleaving a second command type into the same
+  // request/response cycle is exactly the kind of change this
+  // function must NOT make relative to that proven design.
+  bool upper_ready = false;
+  bool lower_ready = false;
+  {
+    std::thread t1([&](){
+        mutex_upper_.lock();
+        upper_ready = controller_upper_->poll_calibration_status();
+        mutex_upper_.unlock();
+      });
+    std::thread t2([&](){
+        mutex_lower_.lock();
+        lower_ready = controller_lower_->poll_calibration_status();
+        mutex_lower_.unlock();
+      });
+    t1.join();
+    t2.join();
+  }
+
+  if (upper_ready && lower_ready) {
+    ROS_WARN("=========================================================");
+    ROS_WARN(" Calibration complete: origin-return finished on both");
+    ROS_WARN(" upper and lower motor drivers (STGET responding again).");
+    ROS_WARN(" Resuming and resetting command limits.");
+    ROS_WARN("=========================================================");
+    reset_pending_ = false;
+    controllers_need_reset_ = true;
+    // prev_cmd_ inside the saturation interface still holds the
+    // pre-outage target and must be reset to NaN so enforceLimits()
+    // re-seeds it from the measured position instead of ramping back
+    // toward it.
+    pj_sat_interface_.reset();
+    // write()'s per-joint "unchanged since last send" mask compares
+    // the freshly re-seeded command against prev_ref_positions_, which
+    // still holds the pre-outage target too. Left alone, a freshly
+    // reset controller commanding that same stale value looks
+    // "unchanged" and gets masked out entirely -- no MOVE is sent for
+    // that joint at all, so nothing is actively holding it against
+    // gravity right when resuming. NaN forces a mismatch so every
+    // joint's first post-recovery command is actually sent.
+    std::fill(prev_ref_positions_.begin(), prev_ref_positions_.end(),
+              std::numeric_limits<double>::quiet_NaN());
+    return;
+  }
+
+  double elapsed = (ros::Time::now() - reset_pending_start_).toSec();
+  ROS_WARN_THROTTLE(5.0,
+      "still waiting for re-calibration... upper: %s, lower: %s "
+      "(%.0f s elapsed)",
+      upper_ready ? "ready" : "waiting",
+      lower_ready ? "ready" : "waiting", elapsed);
+}
+
 void AeroRobotHW::readPos(const ros::Time& time, const ros::Duration& period, bool update)
 {
   /////
@@ -292,12 +465,15 @@ void AeroRobotHW::readPos(const ros::Time& time, const ros::Duration& period, bo
     joint_effort_[j]   = 0;        // read effort   from HW
   }
 
-  // A servo power cycle (servo-on button) drops the motor driver
-  // communication. On recovery the command buffers still hold the
-  // pre-outage target, which would snap the arm back to it as soon as
-  // anything is commanded. Restarting the running controllers clears
-  // that: stopping() preempts the active goal and starting() re-inits
-  // their setpoints from the measured position.
+  // A servo power cycle (e.g. RUNSTOP) drops the motor driver
+  // communication; this is the GET_POS read-back already done above
+  // (via update_position()/set_position(), whichever ran this cycle)
+  // noticing it came back. Enter the same "wait for calibration"
+  // state write() uses at startup -- see reset_pending_ -- instead of
+  // sending position commands into a driver that may still be
+  // mid re-calibration: pollCalibrationCompletion() (called from
+  // write() while this is true) confirms via STGET that it has
+  // actually finished before resuming.
   bool recovered = false;
   mutex_upper_.lock();
   recovered |= controller_upper_->check_comm_recovered();
@@ -307,46 +483,9 @@ void AeroRobotHW::readPos(const ros::Time& time, const ros::Duration& period, bo
   mutex_lower_.unlock();
 
   if (recovered) {
-    ROS_WARN("communication recovered: waiting for the robot to settle");
+    ROS_WARN("communication recovered: waiting for calibration to complete");
     reset_pending_ = true;
-    settle_count_ = 0;
-    settle_wait_count_ = 0;
-    settle_positions_ = joint_position_;
-  }
-
-  if (reset_pending_) {
-    // The motor driver calibrates itself when the servo powers on, so
-    // the robot may still be moving right after communication comes
-    // back. Restarting the controllers now would make them hold a
-    // mid-calibration position and pull the robot back to it, so wait
-    // until the measured position stops changing.
-    bool still = true;
-    for (unsigned int j = 0; j < number_of_angles_; j++) {
-      if (std::fabs(joint_position_[j] - settle_positions_[j]) > SETTLE_EPS_) {
-        still = false;
-      }
-    }
-    settle_positions_ = joint_position_;
-    settle_count_ = still ? (settle_count_ + 1) : 0;
-    settle_wait_count_++;
-
-    if (settle_count_ >= SETTLE_CYCLES_ ||
-        settle_wait_count_ >= SETTLE_MAX_CYCLES_) {
-      if (settle_count_ < SETTLE_CYCLES_) {
-        ROS_WARN("still moving after %d cycles, restarting controllers anyway",
-                 settle_wait_count_);
-      } else {
-        ROS_WARN("settled: restarting controllers and resetting command limits");
-      }
-      reset_pending_ = false;
-      controllers_need_reset_ = true;
-      // The saturation interface rate-limits each command against its
-      // own prev_cmd_, which still holds the pre-outage target. Left
-      // alone it would ramp from there, driving the robot back toward
-      // the old position for a moment. Resetting clears prev_cmd_ to
-      // NaN so enforceLimits() re-seeds it from the measured position.
-      pj_sat_interface_.reset();
-    }
+    reset_pending_start_ = ros::Time::now();
   }
 
   if (!initialized_flag_) {
@@ -377,6 +516,22 @@ void AeroRobotHW::read(const ros::Time& time, const ros::Duration& period)
 void AeroRobotHW::write(const ros::Time& time, const ros::Duration& period)
 {
   ROS_DEBUG("write");
+
+  if (reset_pending_) {
+    // readPos() noticed communication recovered from a loss (e.g.
+    // RUNSTOP was pressed) and is now waiting for
+    // pollCalibrationCompletion() to confirm, via STGET, that the
+    // following re-calibration is actually complete. Sending any
+    // position command now -- even a stale, unchanged one -- would
+    // fight that origin-return exactly like it would at startup, so
+    // hold off entirely. Deliberately does NOT also poll GET_POS
+    // (readPos/update_position()) here -- joint_states goes stale
+    // during the wait, but interleaving a second command type with
+    // STGET every cycle is not something waitForCalibration()'s
+    // (known-reliable) STGET-only polling does either.
+    pollCalibrationCompletion();
+    return;
+  }
 
   pj_sat_interface_.enforceLimits(period);
   //pj_limits_interface_.enforceLimits(period);

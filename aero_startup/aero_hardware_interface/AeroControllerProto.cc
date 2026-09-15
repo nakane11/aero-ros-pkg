@@ -47,6 +47,12 @@ namespace {
   const int kLossStreakThreshold = 10;
   const int kRecoveryStreakThreshold = 10;
 
+  // How many consecutive STGET (CMD_WATCH_MISSTEP) replies are
+  // required before origin-return (calibration) is considered
+  // complete. Same debounce reasoning as kLossStreakThreshold: a
+  // single lucky reply must not be mistaken for completion.
+  const int kCalibrationStreakThreshold = 10;
+
   // Prints _msg through std::cerr at most once every kLogThrottleSec,
   // regardless of how often this is called. Communication-loss errors
   // repeat every retry, which would otherwise flood the console.
@@ -489,7 +495,7 @@ AeroControllerProto::AeroControllerProto(const std::string& _port,
 					 uint8_t _id) :
   seed_(_port, _id), verbose_(false), comm_was_lost_(true),
   comm_recovered_latch_(false), comm_fail_streak_(0), comm_ok_streak_(0),
-  bad_status_(false)
+  calibration_ok_streak_(0), bad_status_(false)
 {
 }
 
@@ -668,6 +674,20 @@ bool AeroControllerProto::check_comm_recovered()
   bool recovered = comm_recovered_latch_;
   comm_recovered_latch_ = false;
   return recovered;
+}
+
+//////////////////////////////////////////////////
+bool AeroControllerProto::poll_calibration_status()
+{
+  bool ok = get_command(CMD_WATCH_MISSTEP, status_vector_);
+  if (!ok) {
+    calibration_ok_streak_ = 0;
+    return false;
+  }
+  if (calibration_ok_streak_ < kCalibrationStreakThreshold) {
+    calibration_ok_streak_++;
+  }
+  return calibration_ok_streak_ >= kCalibrationStreakThreshold;
 }
 
 //////////////////////////////////////////////////

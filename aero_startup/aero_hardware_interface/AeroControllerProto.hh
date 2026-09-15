@@ -161,6 +161,17 @@ namespace aero
       ///   once per recovery.
      public: bool check_comm_recovered();
 
+      /// @brief send one STGET (CMD_WATCH_MISSTEP) and debounce the
+      ///   result into an origin-return (calibration) completion
+      ///   signal. The motor driver simply does not reply to STGET
+      ///   while mid origin-return and replies reliably once it is
+      ///   done, regardless of what the Robot Status bits then say --
+      ///   see the comment on calibration_ok_streak_ for why the bits
+      ///   themselves are not used for this judgement.
+      /// @return true once kCalibrationStreakThreshold consecutive
+      ///   calls got a reply
+     public: bool poll_calibration_status();
+
       /// @brief track communication loss/recovery of a read-back
      protected: void note_comm_result(bool _ok);
 
@@ -274,6 +285,17 @@ namespace aero
       ///   comm_recovered_latch_.
      protected: int comm_fail_streak_;
      protected: int comm_ok_streak_;
+
+      /// @brief consecutive successful STGET replies since the last
+      ///   failure, used to debounce origin-return (calibration)
+      ///   completion in poll_calibration_status(). Robot Status bits
+      ///   (see get_data()) are a live summary the driver keeps
+      ///   updated from its own background polling of the motor
+      ///   drivers, not a one-shot "origin-return finished" event --
+      ///   e.g. the "motor abnormal" bit stays set for as long as the
+      ///   servo itself is off, long after a successful calibration --
+      ///   so they must not be used to judge calibration completion.
+     protected: int calibration_ok_streak_;
 
      protected: std::vector<AJointIndex> stroke_joint_indices_;
 

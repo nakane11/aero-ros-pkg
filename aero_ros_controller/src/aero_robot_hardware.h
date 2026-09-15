@@ -186,6 +186,26 @@ public:
   }
 
 protected:
+  /// @brief blocks (from init(), before the ControllerManager is
+  ///   constructed) until origin-return (calibration) of both motor
+  ///   drivers is confirmed complete, so no position command can reach
+  ///   them while they are still calibrating.
+  /// @return false only if ros::ok() went false while waiting
+  bool waitForCalibration();
+
+  /// @brief called from write(), once per cycle, while reset_pending_
+  ///   is true, instead of sending any position command. Polls STGET
+  ///   (same debounced signal waitForCalibration() uses) to detect
+  ///   that a re-calibration following a RUNSTOP-triggered
+  ///   communication loss has actually finished -- not just that
+  ///   communication came back -- before resuming. Only called while
+  ///   commands are already held back, so, unlike a background poll
+  ///   running at all times, this never competes with normal position
+  ///   commands for the serial link. Waits indefinitely: clears
+  ///   reset_pending_ and flags controllers_need_reset_ only once both
+  ///   sides confirm.
+  void pollCalibrationCompletion();
+
   // Methods used to control a joint.
   enum ControlMethod {EFFORT, POSITION, POSITION_PID, VELOCITY, VELOCITY_PID};
   enum JointType {NONE, PRISMATIC, ROTATIONAL, CONTINUOUS, FIXED};
@@ -227,13 +247,17 @@ protected:
   bool initialized_flag_;
   bool controllers_need_reset_;
 
-  // Waiting for the robot to stop moving after communication came
-  // back: the motor driver calibrates itself on servo power-on, and
-  // controllers must only be restarted once that motion has finished.
+  // Set by readPos() when the GET_POS read-back (already done every
+  // control cycle) reports communication recovered from a loss (e.g.
+  // RUNSTOP was pressed, dropping power to the motor drivers, and the
+  // driver is now re-running its origin-return). write() holds off
+  // sending any position command while this is true, for as long as
+  // it takes -- cleared, and controllers_need_reset_ flagged, only
+  // once pollCalibrationCompletion() sees STGET confirm the
+  // (re-)calibration is actually complete, not just that
+  // communication itself came back.
   bool reset_pending_;
-  int  settle_count_;
-  int  settle_wait_count_;
-  std::vector<double> settle_positions_;
+  ros::Time reset_pending_start_;
   bool upper_send_enable_;
 
   int   CONTROL_PERIOD_US_;

@@ -27,8 +27,15 @@
 
   <!-- spawing joint controllers -->
   <!-- names of controllers depend on robot type (described at controller_settings.yaml) -->
+  <!-- respawn="true": aero_ros_controller's ControllerManager now only
+       comes up once motor driver calibration is confirmed complete
+       (AeroRobotHW::init() blocks until then), which can take well
+       longer than this spawner's internal wait-for-controller_manager
+       timeout. Without respawn, a single failed attempt here means no
+       controller is ever loaded for the rest of this session. -->
   <node name="cm_spawner" pkg="controller_manager"
-        type="spawner" args="joint_state_controller larm_controller rarm_controller
+        type="spawner" respawn="true"
+        args="joint_state_controller larm_controller rarm_controller
                              head_controller waist_controller lifter_controller
                              lhand_controller rhand_controller" />
 
